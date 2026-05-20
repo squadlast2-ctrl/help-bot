@@ -1,0 +1,5 @@
+python-telegram-bot==21.6
+supabase==2.7.4
+openai==1.30.0
+python-dotenv==1.0.1
+apscheduler==3.10.4
