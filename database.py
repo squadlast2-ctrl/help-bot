@@ -1,147 +1,192 @@
-import os
-from supabase import create_client, Client
-from datetime import datetime, timezone
-from dotenv import load_dotenv
+from supabase import create_client
+from config import SUPABASE_URL, SUPABASE_KEY
+from datetime import datetime, timedelta
 
-load_dotenv()
-
-# ── Подключение ──────────────────────────────────────────────────────────────
-
-def get_db() -> Client:
-    url = os.environ["SUPABASE_URL"]
-    key = os.environ["SUPABASE_KEY"]
-    return create_client(url, key)
-
-db: Client = get_db()
+db = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
-# ── Пользователи ─────────────────────────────────────────────────────────────
+# ─── ПОЛЬЗОВАТЕЛИ ────────────────────────────────────────────────────────────
 
-def get_or_create_user(telegram_id: int, name: str) -> dict:
-    """Находит пользователя или создаёт нового."""
-    result = db.table("users").select("*").eq("telegram_id", telegram_id).execute()
-    if result.data:
-        return result.data[0]
-    new_user = db.table("users").insert({
-        "telegram_id": telegram_id,
-        "name": name,
-    }).execute()
-    return new_user.data[0]
+def save_user(telegram_id: int, name: str):
+    """Создаёт пользователя если не существует."""
+    db.table("users").upsert(
+        {"telegram_id": telegram_id, "name": name},
+        on_conflict="telegram_id"
+    ).execute()
 
 
-# ── События помощи ───────────────────────────────────────────────────────────
+def get_user(telegram_id: int) -> dict | None:
+    res = db.table("users").select("*").eq("telegram_id", telegram_id).execute()
+    return res.data[0] if res.data else None
 
-def create_event(user_id: int, description: str, photo_urls: list[str] = None) -> dict:
-    """Создаёт новую запись о помощи."""
-    event = db.table("events").insert({
-        "user_id": user_id,
+
+# ─── СОБЫТИЯ ПОМОЩИ ───────────────────────────────────────────────────────────
+
+def save_event(telegram_id: int, description: str, photo_urls: list = []) -> str:
+    """Сохраняет событие помощи и создаёт напоминания."""
+    res = db.table("events").insert({
+        "user_id":     telegram_id,
         "description": description,
-        "photo_urls": photo_urls or [],
-        "status": "active",
+        "photo_urls":  photo_urls,
+        "status":      "active"
     }).execute()
-    return event.data[0]
+
+    event_id = res.data[0]["id"]
+
+    # Напоминания на 30 / 60 / 90 дней
+    for reminder_type in ["day_30", "day_60", "day_90"]:
+        db.table("reminders").insert({
+            "user_id":  telegram_id,
+            "event_id": event_id,
+            "type":     reminder_type,
+            "sent":     False
+        }).execute()
+
+    return event_id
 
 
-def get_active_events(user_id: int) -> list[dict]:
-    """Все открытые истории пользователя (возврат ещё не записан)."""
-    result = db.table("events") \
-        .select("*") \
-        .eq("user_id", user_id) \
-        .eq("status", "active") \
-        .order("created_at", desc=True) \
-        .execute()
-    return result.data
+def get_active_events(telegram_id: int) -> list:
+    """Возвращает все активные события пользователя."""
+    return db.table("events").select("*")\
+        .eq("user_id", telegram_id)\
+        .eq("status", "active")\
+        .order("created_at").execute().data
 
 
-def get_events_last_30_days(user_id: int) -> list[dict]:
-    """Все события за последние 30 дней вместе с возвратами (для Зеркала)."""
-    result = db.table("events") \
-        .select("*, returns(*)") \
-        .eq("user_id", user_id) \
-        .gte("created_at", "now() - interval '30 days'") \
-        .execute()
-    return result.data
+def get_all_events(telegram_id: int) -> list:
+    """Возвращает все события пользователя."""
+    return db.table("events").select("*")\
+        .eq("user_id", telegram_id)\
+        .order("created_at").execute().data
 
 
-def close_event(event_id: str) -> dict:
-    """Закрывает историю когда записан возврат."""
-    result = db.table("events") \
-        .update({"status": "closed"}) \
-        .eq("id", event_id) \
-        .execute()
-    return result.data[0]
+def close_event(event_id: str):
+    """Закрывает событие после получения возврата."""
+    db.table("events").update({"status": "closed"})\
+        .eq("id", event_id).execute()
 
 
-def get_last_event_date(user_id: int) -> datetime | None:
-    """Дата последней записи пользователя (для детектора тишины)."""
-    result = db.table("events") \
-        .select("created_at") \
-        .eq("user_id", user_id) \
-        .order("created_at", desc=True) \
-        .limit(1) \
-        .execute()
-    if not result.data:
+# ─── ВОЗВРАТЫ ─────────────────────────────────────────────────────────────────
+
+def save_return(telegram_id: int, description: str, photo_urls: list = []) -> str | None:
+    """
+    Привязывает возврат к последнему активному событию пользователя.
+    Возвращает event_id или None если активных событий нет.
+    """
+    events = get_active_events(telegram_id)
+    if not events:
         return None
-    return datetime.fromisoformat(result.data[0]["created_at"])
 
+    # Берём самое старое активное событие (первое в очереди)
+    event = events[0]
 
-# ── Возвраты ─────────────────────────────────────────────────────────────────
-
-def create_return(event_id: str, description: str, photo_urls: list[str] = None) -> dict:
-    """Записывает возврат к конкретной истории."""
-    ret = db.table("returns").insert({
-        "event_id": event_id,
+    db.table("returns").insert({
+        "event_id":    event["id"],
         "description": description,
-        "photo_urls": photo_urls or [],
+        "photo_urls":  photo_urls
     }).execute()
-    close_event(event_id)
-    return ret.data[0]
+
+    # Закрываем событие
+    close_event(event["id"])
+
+    return event["id"]
 
 
-# ── Хранилище фото ───────────────────────────────────────────────────────────
+def get_returns_for_event(event_id: str) -> list:
+    return db.table("returns").select("*")\
+        .eq("event_id", event_id).execute().data
 
-def upload_photo(user_id: int, event_id: str, file_bytes: bytes,
-                 filename: str, is_return: bool = False) -> str:
+
+def get_all_returns(telegram_id: int) -> list:
+    """Возвращает все возвраты пользователя через join событий."""
+    events = get_all_events(telegram_id)
+    if not events:
+        return []
+    event_ids = [e["id"] for e in events]
+    return db.table("returns").select("*")\
+        .in_("event_id", event_ids).execute().data
+
+
+# ─── СТАТИСТИКА ───────────────────────────────────────────────────────────────
+
+def get_stats(telegram_id: int) -> dict:
+    events  = get_all_events(telegram_id)
+    returns = get_all_returns(telegram_id)
+    active  = [e for e in events if e["status"] == "active"]
+    return {
+        "total_events":  len(events),
+        "total_returns": len(returns),
+        "active_events": len(active),
+        "closed_events": len(events) - len(active)
+    }
+
+
+# ─── НАПОМИНАНИЯ ──────────────────────────────────────────────────────────────
+
+def get_pending_reminders() -> list:
     """
-    Загружает фото в Supabase Storage.
-    Возвращает публичный URL файла.
-
-    Путь: help-media / user_{id} / event_{id} / [return_] filename
+    Возвращает напоминания которые пора отправить.
+    Считаем дату из events.created_at + смещение по типу.
     """
-    prefix = "return_" if is_return else ""
-    path = f"user_{user_id}/event_{event_id}/{prefix}{filename}"
+    OFFSETS = {"day_30": 30, "day_60": 60, "day_90": 90, "silence_2d": 2}
 
-    db.storage.from_("help-media").upload(
-        path=path,
-        file=file_bytes,
-        file_options={"content-type": "image/jpeg"},
-    )
+    # Берём все неотправленные напоминания с данными события и пользователя
+    res = db.table("reminders")\
+        .select("*, events(*), users(*)")\
+        .eq("sent", False)\
+        .in_("type", ["day_30", "day_60", "day_90"])\
+        .execute()
 
-    # Получаем публичную ссылку
-    public_url = db.storage.from_("help-media").get_public_url(path)
-    return public_url
+    now = datetime.utcnow()
+    due = []
 
+    for rem in res.data:
+        event = rem.get("events")
+        if not event:
+            continue
+        created_at = datetime.fromisoformat(
+            event["created_at"].replace("Z", "+00:00").replace("+00:00", "")
+        )
+        days = OFFSETS.get(rem["type"], 999)
+        if now >= created_at + timedelta(days=days):
+            due.append(rem)
 
-# ── Напоминания ───────────────────────────────────────────────────────────────
-
-def reminder_already_sent(user_id: int, event_id: str | None, reminder_type: str) -> bool:
-    """Проверяет, было ли уже отправлено такое напоминание."""
-    query = db.table("reminders") \
-        .select("id") \
-        .eq("user_id", user_id) \
-        .eq("type", reminder_type) \
-        .eq("sent", True)
-    if event_id:
-        query = query.eq("event_id", event_id)
-    result = query.execute()
-    return len(result.data) > 0
+    return due
 
 
-def mark_reminder_sent(user_id: int, event_id: str | None, reminder_type: str):
-    """Помечает напоминание как отправленное."""
-    db.table("reminders").insert({
-        "user_id": user_id,
-        "event_id": event_id,
-        "type": reminder_type,
-        "sent": True,
-    }).execute()
+def get_pending_silence_reminders() -> list:
+    """
+    Возвращает пользователей которые не писали 2+ дня.
+    Ищем тех у кого последнее событие было 2+ дней назад и нет напоминания silence_2d.
+    """
+    two_days_ago = (datetime.utcnow() - timedelta(days=2)).isoformat()
+
+    # Активные события старше 2 дней
+    old_events = db.table("events").select("*, users(*)")\
+        .eq("status", "active")\
+        .lt("created_at", two_days_ago)\
+        .execute().data
+
+    due = []
+    for event in old_events:
+        # Проверяем не отправляли ли уже silence_2d для этого события
+        existing = db.table("reminders").select("id")\
+            .eq("event_id", event["id"])\
+            .eq("type", "silence_2d")\
+            .execute().data
+        if not existing:
+            due.append(event)
+            # Создаём запись чтобы не слать повторно
+            db.table("reminders").insert({
+                "user_id":  event["user_id"],
+                "event_id": event["id"],
+                "type":     "silence_2d",
+                "sent":     True
+            }).execute()
+
+    return due
+
+
+def mark_reminder_sent(reminder_id: str):
+    db.table("reminders").update({"sent": True})\
+        .eq("id", reminder_id).execute()
